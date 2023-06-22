@@ -37,7 +37,7 @@ Module exports :class:`KuehnEtAl2020SInter`,
 import numpy as np
 import os
 import h5py
-from scipy.interpolate import interp1d
+from scipy.interpolate import interp1d, RegularGridInterpolator
 
 from openquake.hazardlib.gsim.base import GMPE, CoeffsTable, add_alias
 from openquake.hazardlib import const
@@ -549,90 +549,31 @@ def _retrieve_sigma_mu_data(trt, region):
         trt == const.TRT.SUBDUCTION_INTERFACE else \
         REGION_TERMS_SLAB[region]["file_unc"]
     fle = h5py.File(os.path.join(BASE_PATH, fname), "r")
+
+    mag = fle["M"][:]
+    rrup = fle["R"][:]
+    periods = fle["T"][:]
+    pga = fle["PGA"][:]
+    pgv = fle["PGV"][:]
+    sa = fle["SA"][:]
+
+    # Order of the tables is not guaranteed
+    # Get indices to perform sorting
+    mag_idx = np.argsort(mag)
+    rrup_idx = np.argsort(rrup)
+    periods_idx = np.argsort(periods)
+
     sigma_mu = {
-        "M": fle["M"][:],
-        "R": fle["R"][:],
-        "periods": fle["T"][:],
-        "PGA":  fle["PGA"][:],
-        "PGV": fle["PGV"][:],
-        "SA": fle["SA"][:]}
+        "M": mag[mag_idx],
+        "R": rrup[rrup_idx],
+        "periods": periods[periods_idx],
+        "PGA":  pga[mag_idx, :][:, rrup_idx],
+        "PGV": pgv[mag_idx, :][:, rrup_idx],
+        "SA": sa[mag_idx, :, :][:, rrup_idx, :][:, :, periods_idx]}
     fle.close()
     return sigma_mu
 
-def get_sigma_mu_adjustment(model, imt, mags, rrups):
-    """
-    Returns the sigma mu adjustment factor for the given scenario set by
-    interpolation from the tables
-
-    :param dict model:
-        Sigma mu model as a dictionary containing the sigma mu tables
-        (as output from _retrieve_sigma_mu_data)
-    :param imt:
-        Intensity measure type
-    :param mag:
-        Magnitude
-    :param rrup:
-        Distances
-
-    :returns:
-        sigma_mu for the scenarios (numpy.ndarray)
-    """
-
-    # No correction factor needed
-    if not model:
-        return np.zeros_like(mags)
-
-    # Output
-    out = np.zeros_like(mags)
-
-    # Work on PGA and PGV
-    if imt.string in "PGA PGV":
-        sigma_mu = model[imt.string]
-
-        for imag, mag in enumerate(mags):
-
-            if mag <= model["M"][0]:
-                sigma_mu_m = sigma_mu[0, :]
-            elif mag >= model["M"][-1]:
-                sigma_mu_m = sigma_mu[-1, :]
-            else:
-                intpl1 = interp1d(model["M"], sigma_mu, axis=0)
-                sigma_mu_m = intpl1(mag)
-
-            # Linear interpolation with distance
-            intpl2 = interp1d(model["R"], sigma_mu_m, bounds_error=False,
-                              fill_value=(sigma_mu_m[0], sigma_mu_m[-1]))
-            out[imag] = intpl2(rrups[imag])
-
-        return out
-
-    # Other IMTs
-    for imag, mag in enumerate(mags):
-
-        if mag <= model["M"][0]:
-            sigma_mu_m = model["SA"][0, :, :]
-        elif mag >= model["M"][-1]:
-            sigma_mu_m = model["SA"][-1, :, :]
-        else:
-            intpl1 = interp1d(model["M"], model["SA"], axis=0)
-            sigma_mu_m = intpl1(mag)
-
-        # Get values for period - N.B. ln T, linear sigma mu interpolation
-        if imt.period <= model["periods"][0]:
-            sigma_mu_t = sigma_mu_m[:, 0]
-        elif imt.period >= model["periods"][-1]:
-            sigma_mu_t = sigma_mu_m[:, -1]
-        else:
-            intpl2 = interp1d(np.log(model["periods"]), sigma_mu_m, axis=1)
-            sigma_mu_t = intpl2(np.log(imt.period))
-
-        intpl3 = interp1d(model["R"], sigma_mu_t, bounds_error=False,
-                          fill_value=(sigma_mu_t[0], sigma_mu_t[-1]))
-        out[imag] = intpl3(rrups[imag])
-
-    return out
-
-def get_sigma_mu_adjustment_old(model, imt, mag, rrup):
+def get_sigma_mu_adjustment(model, imt, mag, rrup):
     """
     Returns the sigma mu adjustment factor for the given scenario set by
     interpolation from the tables
@@ -651,41 +592,60 @@ def get_sigma_mu_adjustment_old(model, imt, mag, rrup):
         sigma_mu for the scenarios (numpy.ndarray)
     """
     if not model:
-        return 0.0
+        return np.zeros_like(mag)
+
+    # Get the correct sigma_mu model
+    is_SA = imt.string not in "PGA PGV"
+    sigma_mu_model = model["SA"] if is_SA else model[imt.string]
+
+    model_m = model["M"]
+    model_r = model["R"]
+
+    # Extend the sigma_mu_model as needed
+    # Prevents having to deal with values
+    # outside the model range manually
+    if np.any(mag > model["M"][-1]):
+        sigma_mu_model = np.concatenate(
+            (sigma_mu_model, sigma_mu_model[-1, :][np.newaxis, :]), axis=0)
+        model_m = np.concatenate((model_m, [mag.max()]), axis=0)
+    if np.any(mag < model["M"][0]):
+        sigma_mu_model = np.concatenate(
+            (sigma_mu_model[0, :][np.newaxis, :], sigma_mu_model), axis=0)
+        model_m = np.concatenate(([mag.min()], model_m), axis=0)
+    if np.any(rrup > model["R"][-1]):
+        sigma_mu_model = np.concatenate(
+            (sigma_mu_model, sigma_mu_model[:, -1][:, np.newaxis]), axis=1)
+        model_r = np.concatenate((model_r, [rrup.max()]), axis=0)
+    if np.any(rrup < model["R"][0]):
+        sigma_mu_model = np.concatenate(
+            (sigma_mu_model[:, 0][:, np.newaxis], sigma_mu_model), axis=1)
+        model_r = np.concatenate(([rrup.min()], model_r), axis=0)
+
     if imt.string in "PGA PGV":
-        # PGA and PGV are 2D arrays of dimension [nmags, ndists]
-        sigma_mu = model[imt.string]
-        if mag <= model["M"][0]:
-            sigma_mu_m = sigma_mu[0, :]
-        elif mag >= model["M"][-1]:
-            sigma_mu_m = sigma_mu[-1, :]
-        else:
-            intpl1 = interp1d(model["M"], sigma_mu, axis=0)
-            sigma_mu_m = intpl1(mag)
-        # Linear interpolation with distance
-        intpl2 = interp1d(model["R"], sigma_mu_m, bounds_error=False,
-                          fill_value=(sigma_mu_m[0], sigma_mu_m[-1]))
-        return intpl2(rrup)
-    # In the case of SA the array is of dimension [nmags, ndists, nperiods]
-    # Get values for given magnitude
-    if mag <= model["M"][0]:
-        sigma_mu_m = model["SA"][0, :, :]
-    elif mag >= model["M"][-1]:
-        sigma_mu_m = model["SA"][-1, :, :]
+        # Linear interpolation
+        interp = RegularGridInterpolator(
+            (model_m, model_r), sigma_mu_model, bounds_error=True,)
+        sigma_mu = interp(np.stack((mag, rrup), axis=1))
     else:
-        intpl1 = interp1d(model["M"], model["SA"], axis=0)
-        sigma_mu_m = intpl1(mag)
-    # Get values for period - N.B. ln T, linear sigma mu interpolation
-    if imt.period <= model["periods"][0]:
-        sigma_mu_t = sigma_mu_m[:, 0]
-    elif imt.period >= model["periods"][-1]:
-        sigma_mu_t = sigma_mu_m[:, -1]
-    else:
-        intpl2 = interp1d(np.log(model["periods"]), sigma_mu_m, axis=1)
-        sigma_mu_t = intpl2(np.log(imt.period))
-    intpl3 = interp1d(model["R"], sigma_mu_t, bounds_error=False,
-                      fill_value=(sigma_mu_t[0], sigma_mu_t[-1]))
-    return intpl3(rrup)
+        model_t = model["periods"]
+
+        # Extend for extreme periods as needed
+        if np.any(imt.period > model["periods"][-1]):
+            sigma_mu_model = np.concatenate(
+                (sigma_mu_model, sigma_mu_model[:, :, -1][:, :, np.newaxis]), axis=2)
+            model_t = np.concatenate((model_t, [imt.period.max()]), axis=0)
+        if np.any(imt.period < model["periods"][0]):
+            sigma_mu_model = np.concatenate(
+                (sigma_mu_model[:, :, 0][:, :, np.newaxis], sigma_mu_model), axis=2)
+            model_t = np.concatenate(([imt.period.min()], model_t), axis=0)
+
+        # Linear interpolation
+        interp = RegularGridInterpolator(
+            (model_m, model_r, np.log(model_t)), sigma_mu_model, bounds_error=True,)
+        sigma_mu = interp(
+            np.stack((mag, rrup, np.ones_like(mag) * np.log(imt.period)), axis=1))
+
+    return sigma_mu
 
 def get_backarc_term(trt, imt, ctx):
 
@@ -889,8 +849,8 @@ class KuehnEtAl2020SInter(GMPE):
                                           ctx, pga1100) + get_backarc_term(trt, imt, ctx)
             # Apply the sigma mu adjustment if necessary
             if self.sigma_mu_epsilon:
-                #[mag] = np.unique(np.round(ctx.mag, 2))
-                sigma_mu_adjust = get_sigma_mu_adjustment(self.sigma_mu_model, imt, ctx.mag, ctx.rrup)
+                sigma_mu_adjust = get_sigma_mu_adjustment(
+                    self.sigma_mu_model, imt, ctx.mag, ctx.rrup)
                 mean[m] += self.sigma_mu_epsilon * sigma_mu_adjust
             # Get standard deviations
             if self.which_sigma == "Modified":
